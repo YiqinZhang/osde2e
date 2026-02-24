@@ -569,9 +569,8 @@ func Provision(provider spi.Provider) (*spi.Cluster, error) {
 	if err != nil {
 		if errors.Is(err, ErrReserveFull) {
 			log.Printf("Reserve full, exiting without provisioning")
-			return nil, nil
 		}
-		return nil, fmt.Errorf("failed to set up or retrieve cluster: %v", err)
+		return nil, fmt.Errorf("failed to set up or retrieve cluster: %w", err)
 	}
 
 	viper.Set(config.Cluster.ID, cluster.ID())
