@@ -12,6 +12,14 @@ import (
 	"github.com/openshift/osde2e/pkg/common/util"
 )
 
+// ArtifactLink represents a single uploaded artifact with its presigned URL.
+// Used to pass S3 upload results into the Slack reporter via config settings.
+type ArtifactLink struct {
+	Name string
+	URL  string
+	Size int64
+}
+
 const (
 	// Slack workflow payload limits (conservative estimate)
 	// Slack workflows can handle much larger payloads than webhooks
@@ -105,16 +113,16 @@ func (s *SlackReporter) buildWorkflowPayload(result *AnalysisResult, config *Rep
 	// Required: analysis (AI response)
 	payload.Analysis = s.buildAnalysisField(result)
 
-	// Optional: extended_logs (test failures)
-	if reportDir, ok := config.Settings["report_dir"].(string); ok && reportDir != "" {
+	// Optional: extended_logs — prefer S3 artifact links, fall back to embedded log content
+	if links, ok := config.Settings["artifact_links"].([]ArtifactLink); ok && len(links) > 0 {
+		payload.ExtendedLogs = s.enforceFieldLimit(s.buildArtifactLinksSection(links), maxWorkflowFieldLength)
+	} else if reportDir, ok := config.Settings["report_dir"].(string); ok && reportDir != "" {
 		if testOutput := s.readTestOutput(reportDir); testOutput != "" {
 			payload.ExtendedLogs = s.enforceFieldLimit(testOutput, maxWorkflowFieldLength)
 		} else {
-			// Provide fallback when logs exist but couldn't be read
 			payload.ExtendedLogs = "No test failure logs found in the report directory."
 		}
 	} else {
-		// Provide fallback when no report directory is configured
 		payload.ExtendedLogs = "Test output logs not available (no report directory configured)."
 	}
 
@@ -228,6 +236,17 @@ func (s *SlackReporter) buildTestSuiteSection(config *ReporterConfig) string {
 	builder.WriteString("\n")
 
 	return builder.String()
+}
+
+// buildArtifactLinksSection formats S3 artifact URLs for the Slack message.
+// Presigned URLs are valid for 7 days after upload.
+func (s *SlackReporter) buildArtifactLinksSection(links []ArtifactLink) string {
+	var builder strings.Builder
+	builder.WriteString("====== 🔗 Artifacts (links expire in 7 days) ======\n")
+	for _, link := range links {
+		builder.WriteString(fmt.Sprintf("▸ %s\n%s\n\n", link.Name, link.URL))
+	}
+	return strings.TrimRight(builder.String(), "\n")
 }
 
 // enforceFieldLimit truncates a field to the maximum allowed length
