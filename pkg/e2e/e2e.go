@@ -30,6 +30,7 @@ import (
 	"github.com/openshift/osde2e/pkg/common/upgrade"
 	"github.com/openshift/osde2e/pkg/common/util"
 	"github.com/openshift/osde2e/pkg/debug"
+	"github.com/openshift/osde2e/pkg/e2e/adhoctestimages"
 	ctrlog "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
@@ -57,11 +58,15 @@ func RunTests(ctx context.Context) int {
 	// Execute tests
 	testErr := orch.Execute(ctx)
 
-	// Analyze logs on failure, if enabled
+	// On failure: upload artifacts, send notifications, and analyze logs
 	if testErr != nil {
 		log.Printf("Tests failed: %v", testErr)
-		// Run log analysis only if enableAnalysis is true and TestSuites and AdHocTestImages are not set
-		// This is to avoid double analysis when adhocTestImages or TestSuites are used
+
+		if err := orch.UploadArtifacts(ctx); err != nil {
+			log.Printf("Artifact upload failed: %v", err)
+		}
+
+		// Built-in test analysis (skipped when TestSuites/AdHoc handle their own)
 		if viper.GetBool(config.LogAnalysis.EnableAnalysis) && viper.GetString(config.Tests.TestSuites) == "" && viper.GetString(config.Tests.AdHocTestImages) == "" {
 			if err := orch.AnalyzeLogs(ctx, testErr); err != nil {
 				log.Printf("Log analysis failed: %v", err)
@@ -94,6 +99,7 @@ type E2EOrchestrator struct {
 	result         *orchestrator.Result
 	suiteConfig    types.SuiteConfig
 	reporterConfig types.ReporterConfig
+	s3Results      []aws.S3UploadResult
 }
 
 // NewOrchestrator creates a new E2E orchestrator instance.
@@ -188,6 +194,43 @@ func (o *E2EOrchestrator) Execute(ctx context.Context) error {
 	return nil
 }
 
+// UploadArtifacts persists test artifacts to S3 and delivers any deferred
+// Slack notifications that were queued during test execution.
+func (o *E2EOrchestrator) UploadArtifacts(ctx context.Context) error {
+	if viper.GetString(config.Tests.LogBucket) == "" {
+		return nil
+	}
+	cleanStaleJunitFiles()
+	if err := o.uploadToS3(); err != nil {
+		return err
+	}
+	o.sendDeferredNotifications(ctx)
+	return nil
+}
+
+// cleanStaleJunitFiles removes junit XML files from previous runs in the report directory,
+// keeping only the file matching the current run suffix.
+func cleanStaleJunitFiles() {
+	reportDir := viper.GetString(config.ReportDir)
+	if reportDir == "" {
+		return
+	}
+	suffix := viper.GetString(config.Suffix)
+	currentJunit := "junit_" + suffix + ".xml"
+
+	walkFn := func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		name := info.Name()
+		if strings.HasPrefix(name, "junit_") && strings.HasSuffix(name, ".xml") && name != currentJunit {
+			os.Remove(path)
+		}
+		return nil
+	}
+	_ = filepath.Walk(reportDir, walkFn)
+}
+
 // AnalyzeLogs performs AI-powered log analysis on test failures.
 func (o *E2EOrchestrator) AnalyzeLogs(ctx context.Context, testErr error) error {
 	log.Println("Running log analysis...")
@@ -209,9 +252,22 @@ func (o *E2EOrchestrator) AnalyzeLogs(ctx context.Context, testErr error) error 
 		notificationConfig = reporter.BuildNotificationConfig(
 			viper.GetString(config.LogAnalysis.SlackWebhook),
 			viper.GetString(config.LogAnalysis.SlackChannel),
-			clusterInfo,
+			&reporter.ClusterInfo{
+				ID:            clusterInfo.ID,
+				Name:          clusterInfo.Name,
+				Provider:      clusterInfo.Provider,
+				Region:        clusterInfo.Region,
+				CloudProvider: clusterInfo.CloudProvider,
+				Version:       clusterInfo.Version,
+			},
 			reportDir,
 		)
+		if notificationConfig != nil && len(o.s3Results) > 0 {
+			artifactLinks := s3ResultsToArtifactLinks(o.s3Results)
+			for i := range notificationConfig.Reporters {
+				notificationConfig.Reporters[i].Settings["artifact_links"] = artifactLinks
+			}
+		}
 	}
 
 	engineConfig := &analysisengine.Config{
@@ -248,27 +304,70 @@ func (o *E2EOrchestrator) Report(ctx context.Context) error {
 	}
 
 	runner.ReportClusterInstallLogs(o.provider)
-
-	// Upload test artifacts to S3 if bucket configured
-	if err := o.uploadToS3(); err != nil {
-		log.Printf("S3 upload failed: %v", err)
-		// Don't fail the overall report phase for S3 upload errors
-	}
-
 	return nil
 }
 
-// uploadToS3 uploads the report directory contents to S3.
+// sendDeferredNotifications delivers Slack notifications that were queued by
+// adhoctestimages during test execution. Called after UploadArtifacts so that
+// presigned S3 URLs are available for inclusion in the message.
+func (o *E2EOrchestrator) sendDeferredNotifications(ctx context.Context) {
+	pending := adhoctestimages.DrainPendingNotifications()
+	if len(pending) == 0 {
+		return
+	}
+
+	webhook := viper.GetString(config.LogAnalysis.SlackWebhook)
+	if webhook == "" || !viper.GetBool(config.Tests.EnableSlackNotify) {
+		return
+	}
+
+	artifactLinks := s3ResultsToArtifactLinks(o.s3Results)
+	slack := reporter.NewSlackReporter()
+
+	for _, p := range pending {
+		if p.TestSuite.SlackChannel == "" {
+			continue
+		}
+
+		cfg := reporter.SlackReporterConfig(webhook, true)
+		cfg.Settings["channel"] = p.TestSuite.SlackChannel
+		cfg.Settings["image"] = p.TestSuite.Image
+		cfg.Settings["env"] = p.Env
+		cfg.Settings["cluster_info"] = &reporter.ClusterInfo{
+			ID:            p.ClusterInfo.ID,
+			Name:          p.ClusterInfo.Name,
+			Provider:      p.ClusterInfo.Provider,
+			Region:        p.ClusterInfo.Region,
+			CloudProvider: p.ClusterInfo.CloudProvider,
+			Version:       p.ClusterInfo.Version,
+		}
+		cfg.Settings["artifact_links"] = artifactLinks
+
+		result := &reporter.AnalysisResult{
+			Status:  "completed",
+			Content: p.AnalysisContent,
+		}
+
+		if err := slack.Report(ctx, result, &cfg); err != nil {
+			log.Printf("Failed to send deferred notification for %s: %v", p.TestSuite.Image, err)
+		}
+	}
+}
+
+// uploadToS3 uploads the report directory contents to S3 and caches results.
+// Subsequent calls are no-ops if artifacts were already uploaded.
 func (o *E2EOrchestrator) uploadToS3() error {
-	// Check if S3 bucket is configured
-	if viper.GetString(config.Tests.LogBucket) == "" {
-		return nil // S3 upload not configured, skip
+	if len(o.s3Results) > 0 {
+		return nil
 	}
 
 	component := deriveComponentFromTestImage()
 	uploader, err := aws.NewS3Uploader(component)
 	if err != nil {
 		return fmt.Errorf("failed to create S3 uploader: %w", err)
+	}
+	if uploader == nil {
+		return nil
 	}
 
 	reportDir := viper.GetString(config.ReportDir)
@@ -281,8 +380,38 @@ func (o *E2EOrchestrator) uploadToS3() error {
 		return fmt.Errorf("failed to upload to S3: %w", err)
 	}
 
+	o.s3Results = results
 	aws.LogS3UploadSummary(results)
 	return nil
+}
+
+// s3ResultsToArtifactLinks converts S3 upload results to artifact links for Slack.
+// Returns links in a fixed order: test_output.log, junit_<suffix>.xml.
+func s3ResultsToArtifactLinks(results []aws.S3UploadResult) []reporter.ArtifactLink {
+	suffix := viper.GetString(config.Suffix)
+	currentJunit := "junit_" + suffix + ".xml"
+
+	orderedNames := []string{"test_output.log", currentJunit}
+
+	byName := make(map[string]aws.S3UploadResult, len(orderedNames))
+	for _, r := range results {
+		if r.PresignedURL == "" {
+			continue
+		}
+		byName[filepath.Base(r.Key)] = r
+	}
+
+	links := make([]reporter.ArtifactLink, 0, len(orderedNames))
+	for _, name := range orderedNames {
+		if r, ok := byName[name]; ok {
+			links = append(links, reporter.ArtifactLink{
+				Name: name,
+				URL:  r.PresignedURL,
+				Size: r.Size,
+			})
+		}
+	}
+	return links
 }
 
 // deriveComponentFromTestImage determines the component name from the test image.

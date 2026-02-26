@@ -512,6 +512,118 @@ func TestSlackReporter_ClusterDetailsFallback(t *testing.T) {
 	})
 }
 
+func TestSlackReporter_ArtifactLinks(t *testing.T) {
+	reporter := NewSlackReporter()
+
+	t.Run("artifact links preferred over embedded logs", func(t *testing.T) {
+		result := &AnalysisResult{Content: "Test analysis"}
+
+		config := &ReporterConfig{
+			Settings: map[string]interface{}{
+				"webhook_url": "https://test.com",
+				"channel":     "C123456",
+				"report_dir":  "testdata/periodic-ci-openshift-osde2e-main-nightly-4.20-osd-aws",
+				"artifact_links": []ArtifactLink{
+					{Name: "test_output.log", URL: "https://s3.example.com/test_output.log?sig=abc", Size: 1024},
+					{Name: "junit_e2e.xml", URL: "https://s3.example.com/junit_e2e.xml?sig=def", Size: 2048},
+				},
+			},
+		}
+
+		payload := reporter.buildWorkflowPayload(result, config)
+
+		if !contains(payload.ExtendedLogs, "Artifacts") {
+			t.Error("should contain artifacts header")
+		}
+		if !contains(payload.ExtendedLogs, "test_output.log") {
+			t.Error("should list test_output.log")
+		}
+		if !contains(payload.ExtendedLogs, "junit_e2e.xml") {
+			t.Error("should list junit_e2e.xml")
+		}
+		if contains(payload.ExtendedLogs, "KB") || contains(payload.ExtendedLogs, "MB") {
+			t.Error("should not contain file sizes")
+		}
+		if !contains(payload.ExtendedLogs, "https://s3.example.com/test_output.log?sig=abc") {
+			t.Error("should contain bare URL")
+		}
+		// Should NOT contain embedded log content
+		if contains(payload.ExtendedLogs, "Log Extract") {
+			t.Error("should not contain embedded log content when artifact links are present")
+		}
+	})
+
+	t.Run("falls back to embedded logs when no artifact links", func(t *testing.T) {
+		result := &AnalysisResult{Content: "Test analysis"}
+
+		config := &ReporterConfig{
+			Settings: map[string]interface{}{
+				"webhook_url": "https://test.com",
+				"channel":     "C123456",
+				"report_dir":  "testdata/periodic-ci-openshift-osde2e-main-nightly-4.20-osd-aws",
+			},
+		}
+
+		payload := reporter.buildWorkflowPayload(result, config)
+
+		if contains(payload.ExtendedLogs, "Artifacts") {
+			t.Error("should not contain artifacts header without artifact links")
+		}
+	})
+
+	t.Run("falls back to embedded logs with empty artifact links", func(t *testing.T) {
+		result := &AnalysisResult{Content: "Test analysis"}
+
+		config := &ReporterConfig{
+			Settings: map[string]interface{}{
+				"webhook_url":    "https://test.com",
+				"channel":        "C123456",
+				"report_dir":     "testdata/periodic-ci-openshift-osde2e-main-nightly-4.20-osd-aws",
+				"artifact_links": []ArtifactLink{},
+			},
+		}
+
+		payload := reporter.buildWorkflowPayload(result, config)
+
+		if contains(payload.ExtendedLogs, "Artifacts") {
+			t.Error("should not contain artifacts header with empty artifact links")
+		}
+	})
+}
+
+func TestSlackReporter_buildArtifactLinksSection(t *testing.T) {
+	reporter := NewSlackReporter()
+
+	links := []ArtifactLink{
+		{Name: "test_output.log", URL: "https://s3.example.com/test_output.log?sig=abc", Size: 512},
+		{Name: "junit_e2e.xml", URL: "https://s3.example.com/junit_e2e.xml?sig=def", Size: 1536},
+	}
+
+	result := reporter.buildArtifactLinksSection(links)
+
+	if !contains(result, "Artifacts") {
+		t.Error("should contain artifacts header")
+	}
+	if !contains(result, "7 days") {
+		t.Error("should mention expiry")
+	}
+	if !contains(result, "▸ test_output.log") {
+		t.Error("should contain label line for first file")
+	}
+	if !contains(result, "https://s3.example.com/test_output.log?sig=abc") {
+		t.Error("should contain bare URL for first file")
+	}
+	if !contains(result, "▸ junit_e2e.xml") {
+		t.Error("should contain label line for second file")
+	}
+	if contains(result, "<") || contains(result, "|") {
+		t.Error("should not use mrkdwn link syntax")
+	}
+	if contains(result, "KB") || contains(result, "MB") || contains(result, " B") {
+		t.Error("should not contain file sizes")
+	}
+}
+
 // Helper function
 func contains(s, substr string) bool {
 	return len(s) > 0 && len(substr) > 0 && (s == substr || len(s) > len(substr) && hasSubstring(s, substr))

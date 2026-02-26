@@ -6,13 +6,13 @@ import (
 	"log"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/go-logr/logr"
 	"github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"github.com/openshift/osde2e-common/pkg/clients/ocm"
 	"github.com/openshift/osde2e/internal/analysisengine"
-	"github.com/openshift/osde2e/internal/reporter"
 	viper "github.com/openshift/osde2e/pkg/common/concurrentviper"
 	"github.com/openshift/osde2e/pkg/common/config"
 	"github.com/openshift/osde2e/pkg/common/executor"
@@ -20,6 +20,30 @@ import (
 	"github.com/openshift/osde2e/pkg/common/providers/ocmprovider"
 	"k8s.io/client-go/tools/clientcmd"
 )
+
+// PendingNotification holds analysis results for deferred Slack delivery.
+// Notifications are queued during test execution and sent after S3 upload
+// so that presigned artifact URLs can be included in the message.
+type PendingNotification struct {
+	AnalysisContent string
+	TestSuite       config.TestSuite
+	ClusterInfo     *analysisengine.ClusterInfo
+	Env             string
+}
+
+var (
+	pendingMu            sync.Mutex
+	pendingNotifications []PendingNotification
+)
+
+// DrainPendingNotifications returns all queued notifications and resets the queue.
+func DrainPendingNotifications() []PendingNotification {
+	pendingMu.Lock()
+	defer pendingMu.Unlock()
+	result := pendingNotifications
+	pendingNotifications = nil
+	return result
+}
 
 var _ = ginkgo.Describe("Ad Hoc Test Images", ginkgo.Ordered, ginkgo.ContinueOnFailure, label.AdHocTestImages, func() {
 	var (
@@ -113,7 +137,10 @@ var _ = ginkgo.Describe("Ad Hoc Test Images", ginkgo.Ordered, ginkgo.ContinueOnF
 		testImageEntries)
 })
 
-// runLogAnalysisForAdHocTestImage performs log analysis powered failure analysis for a specific test image
+// runLogAnalysisForAdHocTestImage runs AI analysis and queues the result for
+// deferred Slack delivery. The engine runs WITHOUT notification config because
+// S3 artifacts have not been uploaded yet at this point. The queued result is
+// later sent by e2e.RunTests after UploadArtifacts populates presigned URLs.
 func runLogAnalysisForAdHocTestImage(ctx context.Context, logger logr.Logger, testSuite config.TestSuite, err error, artifactsDir string) {
 	logger.Info("Running Log analysis for test image", "image", testSuite.Image, "slackChannel", testSuite.SlackChannel)
 
@@ -126,36 +153,10 @@ func runLogAnalysisForAdHocTestImage(ctx context.Context, logger logr.Logger, te
 		Version:       viper.GetString(config.Cluster.Version),
 	}
 
-	// Setup notification config - composable approach for multiple reporters
-	var notificationConfig *reporter.NotificationConfig
-	var reporters []reporter.ReporterConfig
-
-	// Get the global main slack workflow webhook
-	slackWebhook := viper.GetString(config.LogAnalysis.SlackWebhook)
-	enableSlackNotify := viper.GetBool(config.Tests.EnableSlackNotify)
-
-	// Add Slack reporter if enabled, webhook exists, and channel is specified
-	if enableSlackNotify && slackWebhook != "" && testSuite.SlackChannel != "" {
-		slackConfig := reporter.SlackReporterConfig(slackWebhook, true)
-		slackConfig.Settings["channel"] = testSuite.SlackChannel
-		slackConfig.Settings["image"] = testSuite.Image
-		slackConfig.Settings["env"] = viper.GetString(ocmprovider.Env)
-		reporters = append(reporters, slackConfig)
-	}
-
-	// Create notification config if we have any reporters
-	if len(reporters) > 0 {
-		notificationConfig = &reporter.NotificationConfig{
-			Enabled:   true,
-			Reporters: reporters,
-		}
-	}
-
 	engineConfig := &analysisengine.Config{
 		BaseConfig: analysisengine.BaseConfig{
-			ArtifactsDir:       artifactsDir,
-			APIKey:             viper.GetString(config.LogAnalysis.APIKey),
-			NotificationConfig: notificationConfig,
+			ArtifactsDir: artifactsDir,
+			APIKey:       viper.GetString(config.LogAnalysis.APIKey),
 		},
 		PromptTemplate: "default",
 		FailureContext: err.Error(),
@@ -176,4 +177,13 @@ func runLogAnalysisForAdHocTestImage(ctx context.Context, logger logr.Logger, te
 
 	logger.Info("Log analysis completed successfully", "image", testSuite.Image, "resultsDir", fmt.Sprintf("%s/%s/", artifactsDir, analysisengine.AnalysisDirName))
 	log.Printf("=== Log Analysis Result for %s ===\n%s", testSuite.Image, result.Content)
+
+	pendingMu.Lock()
+	pendingNotifications = append(pendingNotifications, PendingNotification{
+		AnalysisContent: result.Content,
+		TestSuite:       testSuite,
+		ClusterInfo:     clusterInfo,
+		Env:             viper.GetString(ocmprovider.Env),
+	})
+	pendingMu.Unlock()
 }
