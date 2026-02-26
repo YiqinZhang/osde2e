@@ -144,7 +144,6 @@ var (
 // that takes place.
 var defaultInspectNamespaces = []string{
 	"openshift-managed-upgrade-operator",
-	"openshift-velero",
 	"openshift-build-test",
 	"openshift-sre-pruning",
 	"openshift-cloud-ingress-operator",
@@ -154,7 +153,6 @@ var defaultInspectNamespaces = []string{
 	"openshift-backplane",
 	"openshift-must-gather-operator",
 	"openshift-splunk-forwarder-operator",
-	"openshift-rbac-permissions",
 }
 
 // Upgrade config keys.
