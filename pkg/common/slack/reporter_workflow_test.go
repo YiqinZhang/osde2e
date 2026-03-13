@@ -27,7 +27,6 @@ func TestSlackReporter_buildWorkflowPayload(t *testing.T) {
 
 	clusterInfo := &ClusterInfo{
 		ID:         "test-123",
-		Name:       "test-cluster",
 		Version:    "4.20",
 		Provider:   "aws",
 		Expiration: "2026-01-28T10:00:00Z",
@@ -126,7 +125,6 @@ func TestSlackReporter_Report_WorkflowFormat(t *testing.T) {
 
 	clusterInfo := &ClusterInfo{
 		ID:      "test-456",
-		Name:    "prod-cluster",
 		Version: "4.21",
 	}
 
@@ -186,7 +184,6 @@ func TestSlackReporter_buildSummaryField(t *testing.T) {
 
 	clusterInfo := &ClusterInfo{
 		ID:         "cluster-789",
-		Name:       "my-test-cluster",
 		Version:    "4.22",
 		Provider:   "gcp",
 		Expiration: "2026-02-01T12:00:00Z",
@@ -482,7 +479,6 @@ func TestSlackReporter_ClusterDetailsFallback(t *testing.T) {
 
 		clusterInfo := &ClusterInfo{
 			ID:       "test-cluster-123",
-			Name:     "my-cluster",
 			Version:  "4.20",
 			Provider: "aws",
 		}

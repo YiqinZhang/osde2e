@@ -296,7 +296,6 @@ func TestSlackReporter_buildClusterInfoSection(t *testing.T) {
 	t.Run("builds complete cluster info", func(t *testing.T) {
 		clusterInfo := &ClusterInfo{
 			ID:         "cluster-abc",
-			Name:       "production-cluster",
 			Version:    "4.23",
 			Provider:   "aws",
 			Expiration: "2026-03-01T00:00:00Z",

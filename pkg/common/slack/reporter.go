@@ -80,13 +80,10 @@ type WorkflowPayload struct {
 
 // ClusterInfo holds cluster information for reporting
 type ClusterInfo struct {
-	ID            string
-	Name          string
-	Provider      string
-	Region        string
-	CloudProvider string
-	Version       string
-	Expiration    string
+	ID         string
+	Provider   string
+	Version    string
+	Expiration string
 }
 
 func (s *SlackReporter) buildWorkflowPayload(result *AnalysisResult, config *ReporterConfig) *WorkflowPayload {
